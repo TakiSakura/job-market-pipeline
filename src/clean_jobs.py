@@ -10,54 +10,9 @@ CLEAN_PATH = ROOT_DIR / "data" / "clean_jobs.json"
 CONFIG_PATH = ROOT_DIR / "config" / "search_config.json"
 
 
-def clean_job_url(url):
+def parse_location(location, default_country):
     """
-    Convert a session-based Job Bank URL into a stable URL.
-
-    Example:
-    https://www.jobbank.gc.ca/jobsearch/jobposting/50000609;jsessionid=...?source=searchresults
-
-    becomes:
-
-    https://www.jobbank.gc.ca/jobsearch/jobposting/50000609
-    """
-    if not url:
-        return None
-
-    match = re.search(r"/jobposting/(\d+)", url)
-
-    if match:
-        job_id = match.group(1)
-        return f"https://www.jobbank.gc.ca/jobsearch/jobposting/{job_id}"
-
-    return url
-
-
-def extract_job_id(url):
-    """
-    Extract the Job Bank job ID from the cleaned job URL.
-
-    Example:
-    https://www.jobbank.gc.ca/jobsearch/jobposting/50000609
-
-    returns:
-
-    50000609
-    """
-    if not url:
-        return None
-
-    match = re.search(r"/jobposting/(\d+)", url)
-
-    if match:
-        return match.group(1)
-
-    return None
-
-
-def parse_location(location):
-    """
-    Normalize Job Bank location strings.
+    Normalize location strings returned by Adzuna.
 
     Examples:
 
@@ -78,7 +33,7 @@ def parse_location(location):
         return {
             "city": None,
             "province": None,
-            "country": "Canada"
+            "country": default_country
         }
 
     location = location.strip()
@@ -87,7 +42,7 @@ def parse_location(location):
         return {
             "city": None,
             "province": None,
-            "country": "Canada"
+            "country": default_country
         }
 
     # Format: Toronto (ON)
@@ -100,7 +55,7 @@ def parse_location(location):
         return {
             "city": city,
             "province": province,
-            "country": "Canada"
+            "country": default_country
         }
 
     # Format: Vancouver, BC
@@ -113,14 +68,23 @@ def parse_location(location):
         return {
             "city": city,
             "province": province,
-            "country": "Canada"
+            "country": default_country
+        }
+
+    # Adzuna commonly returns locations such as Toronto, Ontario, Canada.
+    parts = [part.strip() for part in location.split(",") if part.strip()]
+    if len(parts) >= 2:
+        return {
+            "city": parts[0],
+            "province": parts[1],
+            "country": parts[2] if len(parts) >= 3 else default_country
         }
 
     # Fallback
     return {
         "city": location,
         "province": None,
-        "country": "Canada"
+        "country": default_country
     }
 
 
@@ -156,23 +120,26 @@ def main():
 
     for job in raw_jobs:
 
-        parsed_location = parse_location(job.get("location"))
-
-        clean_url = clean_job_url(
-            job.get("job_url")
+        parsed_location = parse_location(
+            job.get("location"),
+            config["country"]
         )
 
         clean_job = {
-            "job_id": extract_job_id(clean_url),
+            "job_id": job.get("job_id"),
             "title": job.get("title"),
             "company": job.get("company"),
             "city": parsed_location["city"],
             "province": parsed_location["province"],
             "country": parsed_location["country"],
             "posted_date": job.get("posted_date"),
-            "salary": job.get("salary"),
+            "salary_min": job.get("salary_min"),
+            "salary_max": job.get("salary_max"),
+            "description": job.get("description"),
+            "category": job.get("category"),
+            "contract_type": job.get("contract_type"),
             "source": job.get("source"),
-            "job_url": clean_url
+            "job_url": job.get("job_url")
         }
 
         city = clean_job["city"]
@@ -193,18 +160,6 @@ def main():
     )
 
     print(f"Saved to: {CLEAN_PATH}")
-
-    print("\nClean records:")
-
-    for job in clean_jobs:
-        print(
-            json.dumps(
-                job,
-                indent=2,
-                ensure_ascii=False
-            )
-        )
-
 
 if __name__ == "__main__":
     main()

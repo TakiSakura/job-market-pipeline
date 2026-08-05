@@ -1,63 +1,50 @@
 # Job Market Data Pipeline
 
-A Python-based end-to-end data pipeline for collecting, cleaning, tracking, and analyzing job posting data.
-
-The current version runs locally and demonstrates the full pipeline flow from data extraction to historical tracking and pipeline run logging.
+A Python end-to-end pipeline that collects job postings from the Adzuna Jobs API, normalizes them, tracks their history, and logs every pipeline run.
 
 ## Current Pipeline
 
 ```text
-Job Bank
-   ↓
-Data Extraction
-   ↓
-Raw JSON
-   ↓
-Cleaning & Normalization
-   ↓
-Clean JSON
-   ↓
-Historical Tracking
-   ↓
-Pipeline Run Logging
+Adzuna Jobs API
+  -> Extract to raw JSON
+  -> Clean and normalize
+  -> Historical tracking
+  -> Pipeline run logging
 ```
+
+The current implementation runs locally. Google Cloud Run and BigQuery are planned architecture and are not yet implemented.
 
 ## Features
 
-- Configurable job search by role and location
-- Web scraping with Python and BeautifulSoup
-- Raw and clean data layers
-- Location normalization
-- Stable job ID extraction
-- Historical tracking with `first_seen_at` and `last_seen_at`
-- Job observation history
-- End-to-end pipeline orchestration
-- Pipeline run logging
-- Failure detection with failed-step tracking
+- Configurable country, location, and role in `config/search_config.json`
+- Adzuna credentials supplied only through environment variables
+- Raw and clean JSON data layers
+- Location and field normalization
+- API-provided stable job IDs
+- Historical state with `first_seen_at`, `last_seen_at`, and `is_active`
+- Append-only job observations in `data/job_observations.jsonl`
+- Fail-fast pipeline orchestration and run logging in `data/pipeline_runs.jsonl`
 
 ## Project Structure
 
 ```text
-job-market-data-pipeline/
-│
-├── config/
-│   └── search_config.json
-│
-├── src/
-│   ├── main.py
-│   ├── clean_jobs.py
-│   ├── track_history.py
-│   └── pipeline.py
-│
-├── data/
-│   └── generated pipeline outputs
-│
-├── requirements.txt
-├── .gitignore
-└── README.md
+job-market-pipeline/
+|-- config/
+|   `-- search_config.json
+|-- src/
+|   |-- main.py
+|   |-- clean_jobs.py
+|   |-- track_history.py
+|   `-- pipeline.py
+|-- data/                 # generated pipeline outputs
+|-- requirements.txt
+|-- .gitignore
+`-- README.md
 ```
 
-## Example Configuration
+## Configuration
+
+`config/search_config.json`:
 
 ```json
 {
@@ -67,86 +54,50 @@ job-market-data-pipeline/
 }
 ```
 
-## Run the Pipeline
+The country can be a supported country name or a two-letter Adzuna country code such as `ca`.
 
-Create and activate a virtual environment, install dependencies, then run:
+Create a local `.env` file (already ignored by Git):
 
-```bash
-pip install -r requirements.txt
-python src/pipeline.py
+```dotenv
+ADZUNA_APP_ID=your_app_id
+ADZUNA_APP_KEY=your_app_key
 ```
 
-The pipeline will automatically execute:
+Environment variables provided by the runtime take precedence, which makes the same code suitable for later deployment to Cloud Run.
 
-```text
-Extract
-  ↓
-Clean
-  ↓
-Historical Tracking
-  ↓
-Run Logging
+## Run Locally
+
+PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python src\pipeline.py
 ```
 
-## Historical Tracking
+The pipeline stops immediately if extraction, cleaning, or historical tracking fails, and writes the outcome to `data/pipeline_runs.jsonl`.
 
-Each job is identified using a stable `job_id`.
+## Generated Data
 
-The pipeline maintains:
+- `data/raw_jobs.json`: normalized Adzuna extraction output
+- `data/clean_jobs.json`: cleaned records matching the configured location
+- `data/job_state.json`: latest known state of every observed job
+- `data/job_observations.jsonl`: append-only observation history
+- `data/pipeline_runs.jsonl`: pipeline execution history
 
-- `first_seen_at`
-- `last_seen_at`
-- current job state
-- historical observation records
+## Migration from Canada Job Bank
 
-This allows repeated pipeline runs to distinguish newly discovered jobs from previously observed jobs.
-
-## Pipeline Monitoring
-
-Each execution records:
-
-- Run ID
-- Start and finish time
-- Run status
-- Duration
-- Records extracted
-- Records cleaned
-- Failed step
-- Error message
-
-This provides a foundation for pipeline monitoring and failure analysis.
-
-## Tech Stack
-
-**Python · Requests · BeautifulSoup · JSON · Git**
+Adzuna's API `id` is now used directly as `job_id`; IDs are no longer parsed from Job Bank URLs. Salary is represented by `salary_min` and `salary_max`, and clean records now also retain description, category, and contract type. Existing Job Bank state and observations are not rewritten; if retained, they remain historical records alongside newly collected Adzuna records.
 
 ## Planned Architecture
 
-The next phase will migrate the local pipeline to Google Cloud:
-
 ```text
 Cloud Scheduler
-      ↓
-Cloud Run
-      ↓
-Python Pipeline
-      ↓
-BigQuery
-      ↓
-Power BI
+  -> Google Cloud Run (planned)
+  -> Python pipeline
+  -> BigQuery (planned)
+  -> BI/dashboard layer (planned)
 ```
 
-Planned improvements include:
-
-- BigQuery data warehouse integration
-- Cloud Run deployment
-- Scheduled pipeline execution
-- Cloud logging and monitoring
-- Improved location filtering
-- Pagination support
-- Additional job data sources
-- Power BI dashboards
-
-## Goal
-
-The goal of this project is to build a reusable job market data pipeline that continuously collects changing job data, preserves historical information, and prepares analytics-ready datasets for market trend analysis.
+Planned work includes Cloud Run deployment, BigQuery storage, scheduling, cloud logging and monitoring, pagination, and dashboards.
