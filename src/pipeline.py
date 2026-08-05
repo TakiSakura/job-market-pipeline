@@ -73,7 +73,7 @@ def run_step(step_name, script_name):
         check=True
     )
 
-    print(f"\n✓ {step_name} completed")
+    print(f"\n[OK] {step_name} completed")
 
 
 def main():
@@ -85,6 +85,8 @@ def main():
     status = "RUNNING"
     error_message = None
     failed_step = None
+    records_extracted = 0
+    records_clean = 0
 
     print("\nJOB MARKET DATA PIPELINE")
     print("=" * 60)
@@ -109,6 +111,12 @@ def main():
             "main.py"
         )
 
+        # Count only after this run's extraction step succeeds. If extraction
+        # fails, the metric remains zero instead of reading a stale raw file.
+        records_extracted = load_record_count(
+            RAW_PATH
+        )
+
         # -------------------------
         # STEP 2: CLEAN
         # -------------------------
@@ -118,6 +126,12 @@ def main():
         run_step(
             "CLEAN",
             "clean_jobs.py"
+        )
+
+        # Count only after this run's cleaning step succeeds. If cleaning is
+        # skipped or fails, a previous clean dataset is not counted.
+        records_clean = load_record_count(
+            CLEAN_PATH
         )
 
         # -------------------------
@@ -154,18 +168,6 @@ def main():
     duration = (
         finished_at - started_at
     ).total_seconds()
-
-    # -------------------------
-    # RUN METRICS
-    # -------------------------
-
-    records_extracted = load_record_count(
-        RAW_PATH
-    )
-
-    records_clean = load_record_count(
-        CLEAN_PATH
-    )
 
     # -------------------------
     # SAVE RUN LOG

@@ -1,137 +1,150 @@
 import json
+import os
+import sys
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT_DIR / "config" / "search_config.json"
 OUTPUT_PATH = ROOT_DIR / "data" / "raw_jobs.json"
+ADZUNA_API_BASE_URL = "https://api.adzuna.com/v1/api/jobs"
+REQUEST_TIMEOUT_SECONDS = 30
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    config = json.load(f)
-
-role = config["role"]
-location = config["location"]
-
-BASE_URL = "https://www.jobbank.gc.ca"
-SEARCH_URL = f"{BASE_URL}/jobsearch/jobsearch"
-
-params = {
-    "searchstring": role,
-    "locationstring": location
+COUNTRY_CODES = {
+    "australia": "au", "austria": "at", "belgium": "be", "brazil": "br",
+    "canada": "ca", "france": "fr", "germany": "de", "india": "in",
+    "italy": "it", "mexico": "mx", "netherlands": "nl", "new zealand": "nz",
+    "poland": "pl", "singapore": "sg", "south africa": "za", "spain": "es",
+    "switzerland": "ch", "united kingdom": "gb", "uk": "gb",
+    "united states": "us", "usa": "us",
 }
 
-headers = {
-    "User-Agent": "Mozilla/5.0"
-}
 
-print("Requesting Job Bank...")
-print(f"Role: {role}")
-print(f"Location: {location}")
+def country_code(country):
+    value = country.strip().lower()
+    if len(value) == 2:
+        return value
+    if value not in COUNTRY_CODES:
+        raise ValueError(
+            f"Unsupported country '{country}'. Use a supported country name "
+            "or its two-letter Adzuna country code."
+        )
+    return COUNTRY_CODES[value]
 
-response = requests.get(
-    SEARCH_URL,
-    params=params,
-    headers=headers,
-    timeout=30
-)
 
-print(f"Status code: {response.status_code}")
+def nested_display_name(record, field):
+    value = record.get(field)
+    return value.get("display_name") if isinstance(value, dict) else None
 
-response.raise_for_status()
 
-soup = BeautifulSoup(response.text, "html.parser")
+def sanitize_job_url(url):
+    """Remove API-client attribution values from Adzuna redirect URLs."""
+    if not url:
+        return None
 
-job_cards = soup.select("a.resultJobItem")
-
-print(f"Found {len(job_cards)} job posting cards.")
-
-jobs = []
-
-for card in job_cards:
-
-    title_element = card.select_one(".noctitle")
-    company_element = card.select_one("li.business")
-    location_element = card.select_one("li.location")
-    date_element = card.select_one("li.date")
-    salary_element = card.select_one("li.salary")
-    source_element = card.select_one("li.source .wb-inv")
-
-    title = (
-        title_element.get_text(" ", strip=True)
-        if title_element
-        else None
+    parsed = urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() != "utm_source"
+    ]
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
     )
 
-    company = (
-        company_element.get_text(" ", strip=True)
-        if company_element
-        else None
-    )
 
-    job_location = (
-        location_element.get_text(" ", strip=True)
-        .replace("Location", "")
-        .strip()
-        if location_element
-        else None
-    )
-
-    posted_date = (
-        date_element.get_text(" ", strip=True)
-        if date_element
-        else None
-    )
-
-    salary = (
-        salary_element.get_text(" ", strip=True)
-        .replace("Salary", "")
-        .strip()
-        if salary_element
-        else None
-    )
-
-    source = (
-        source_element.get_text(" ", strip=True)
-        if source_element
-        else None
-    )
-
-    relative_url = card.get("href")
-
-    job_url = (
-        urljoin(BASE_URL, relative_url)
-        if relative_url
-        else None
-    )
-
-    job = {
-        "title": title,
-        "company": company,
-        "location": job_location,
-        "posted_date": posted_date,
-        "salary": salary,
-        "source": source,
-        "job_url": job_url
+def normalize_job(job):
+    category = job.get("category")
+    return {
+        "job_id": str(job["id"]) if job.get("id") is not None else None,
+        "title": job.get("title"),
+        "company": nested_display_name(job, "company"),
+        "location": nested_display_name(job, "location"),
+        "posted_date": job.get("created"),
+        "salary_min": job.get("salary_min"),
+        "salary_max": job.get("salary_max"),
+        "description": job.get("description"),
+        "category": category.get("label") if isinstance(category, dict) else None,
+        "contract_type": job.get("contract_type"),
+        "source": "Adzuna",
+        "job_url": sanitize_job_url(job.get("redirect_url")),
     }
 
-    jobs.append(job)
+
+def main():
+    load_dotenv(ROOT_DIR / ".env")
+
+    app_id = os.getenv("ADZUNA_APP_ID")
+    app_key = os.getenv("ADZUNA_APP_KEY")
+    if not app_id or not app_key:
+        raise RuntimeError(
+            "Missing Adzuna credentials. Set ADZUNA_APP_ID and "
+            "ADZUNA_APP_KEY in the environment or in a local .env file."
+        )
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    country = config["country"]
+    location = config["location"]
+    role = config["role"]
+    url = f"{ADZUNA_API_BASE_URL}/{country_code(country)}/search/1"
+    params = {
+        "app_id": app_id,
+        "app_key": app_key,
+        "what": role,
+        "where": location,
+        "results_per_page": 50,
+        "content-type": "application/json",
+    }
+
+    print("Requesting jobs from Adzuna...")
+    print(f"Country: {country}")
+    print(f"Role: {role}")
+    print(f"Location: {location}")
+
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+    except requests.Timeout as error:
+        raise RuntimeError(
+            f"Adzuna request timed out after {REQUEST_TIMEOUT_SECONDS} seconds."
+        ) from error
+    except requests.RequestException as error:
+        # Request exception text can contain the prepared URL and its credentials.
+        raise RuntimeError("Adzuna request failed due to a network error.") from error
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Adzuna API returned HTTP {response.status_code}. "
+            "Check the credentials, configuration, and API availability."
+        )
+
+    try:
+        payload = response.json()
+    except requests.JSONDecodeError as error:
+        raise RuntimeError("Adzuna API returned an invalid JSON response.") from error
+
+    results = payload.get("results", [])
+    if not results:
+        raise RuntimeError(
+            f"Adzuna returned no jobs for role '{role}' in '{location}, {country}'."
+        )
+
+    jobs = [normalize_job(job) for job in results]
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as file:
+        json.dump(jobs, file, ensure_ascii=False, indent=2)
+
+    print(f"Saved {len(jobs)} jobs to: {OUTPUT_PATH}")
 
 
-with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-    json.dump(
-        jobs,
-        f,
-        ensure_ascii=False,
-        indent=2
-    )
-
-print(f"\nSaved {len(jobs)} jobs to:")
-print(OUTPUT_PATH)
-
-print("\nFirst 3 records:")
-
-for job in jobs[:3]:
-    print(json.dumps(job, indent=2, ensure_ascii=False))
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyError, OSError, ValueError, RuntimeError) as error:
+        print(f"Extraction failed: {error}", file=sys.stderr)
+        sys.exit(1)
