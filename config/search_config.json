@@ -1,5 +1,7 @@
 {
   "country": "Canada",
   "location": "Toronto",
-  "role": "Data Analyst"
+  "role": "Data Analyst",
+  "results_per_page": 50,
+  "max_pages": 3
 }

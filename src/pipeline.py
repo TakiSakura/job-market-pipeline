@@ -1,9 +1,12 @@
 import json
+import os
 import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from pipeline_config import PIPELINE_RUN_ID_ENV
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -22,9 +25,6 @@ def utc_now():
 
 
 def load_record_count(path):
-    """
-    Return the number of records in a JSON array.
-    """
     if not path.exists():
         return 0
 
@@ -42,9 +42,11 @@ def load_record_count(path):
 
 
 def append_run_log(record):
-    """
-    Append one pipeline run record as a JSON line.
-    """
+    RUN_LOG_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
     with open(RUN_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(
             json.dumps(
@@ -55,13 +57,13 @@ def append_run_log(record):
         )
 
 
-def run_step(step_name, script_name):
-    """
-    Run one pipeline step.
+def subprocess_environment(run_id):
+    environment = os.environ.copy()
+    environment[PIPELINE_RUN_ID_ENV] = run_id
+    return environment
 
-    If the step fails, stop the entire pipeline.
-    """
 
+def run_step(step_name, script_name, run_id):
     script_path = SRC_DIR / script_name
 
     print("\n" + "=" * 60)
@@ -70,21 +72,53 @@ def run_step(step_name, script_name):
 
     subprocess.run(
         [PYTHON, str(script_path)],
-        check=True
+        check=True,
+        env=subprocess_environment(run_id),
     )
 
     print(f"\n[OK] {step_name} completed")
 
 
+def write_run_log_to_bigquery(run_record):
+    print("\n" + "=" * 60)
+    print("STEP: BIGQUERY RUN LOG")
+    print("=" * 60)
+
+    try:
+        subprocess.run(
+            [
+                PYTHON,
+                str(SRC_DIR / "log_run_bigquery.py"),
+                json.dumps(run_record)
+            ],
+            check=True,
+            env=subprocess_environment(run_record["run_id"]),
+        )
+
+        print(
+            "\n[OK] BIGQUERY RUN LOG completed"
+        )
+
+    except subprocess.CalledProcessError as error:
+        print(
+            "\n[WARNING] Failed to write pipeline run "
+            "log to BigQuery."
+        )
+
+        print(
+            f"Logging process exited with code "
+            f"{error.returncode}."
+        )
+
+
 def main():
-
     run_id = str(uuid.uuid4())
-
     started_at = utc_now()
 
     status = "RUNNING"
     error_message = None
     failed_step = None
+
     records_extracted = 0
     records_clean = 0
 
@@ -108,48 +142,106 @@ def main():
 
         run_step(
             "EXTRACT",
-            "main.py"
+            "main.py",
+            run_id,
         )
 
-        # Count only after this run's extraction step succeeds. If extraction
-        # fails, the metric remains zero instead of reading a stale raw file.
         records_extracted = load_record_count(
             RAW_PATH
         )
 
         # -------------------------
-        # STEP 2: CLEAN
+        # STEP 2: BIGQUERY RAW
+        # -------------------------
+
+        failed_step = "BIGQUERY_RAW"
+
+        run_step(
+            "BIGQUERY RAW",
+            "load_raw_bigquery.py",
+            run_id,
+        )
+
+        # -------------------------
+        # STEP 3: CLEAN
         # -------------------------
 
         failed_step = "CLEAN"
 
         run_step(
             "CLEAN",
-            "clean_jobs.py"
+            "clean_jobs.py",
+            run_id,
         )
 
-        # Count only after this run's cleaning step succeeds. If cleaning is
-        # skipped or fails, a previous clean dataset is not counted.
         records_clean = load_record_count(
             CLEAN_PATH
         )
 
         # -------------------------
-        # STEP 3: HISTORICAL TRACKING
+        # STEP 4: DATA QUALITY / SCORING
         # -------------------------
 
-        failed_step = "HISTORICAL_TRACKING"
+        failed_step = "DATA_QUALITY"
 
         run_step(
-            "HISTORICAL TRACKING",
-            "track_history.py"
+            "DATA QUALITY / SCORING",
+            "data_quality.py",
+            run_id,
+        )
+
+        # -------------------------
+        # STEP 5: BIGQUERY CURATED + PUBLISH VIEW
+        # -------------------------
+
+        failed_step = "BIGQUERY_CURATED"
+
+        run_step(
+            "BIGQUERY CURATED",
+            "load_curated_bigquery.py",
+            run_id,
+        )
+
+        # -------------------------
+        # STEP 6: BIGQUERY CURRENT
+        # -------------------------
+
+        failed_step = "BIGQUERY_CURRENT"
+
+        run_step(
+            "BIGQUERY CURRENT",
+            "load_bigquery.py",
+            run_id,
+        )
+
+        # -------------------------
+        # STEP 7: BIGQUERY OBSERVATIONS
+        # -------------------------
+
+        failed_step = "BIGQUERY_OBSERVATIONS"
+
+        run_step(
+            "BIGQUERY OBSERVATIONS",
+            "load_observations_bigquery.py",
+            run_id,
+        )
+
+        # -------------------------
+        # STEP 8: BIGQUERY STATE
+        # -------------------------
+
+        failed_step = "BIGQUERY_STATE"
+
+        run_step(
+            "BIGQUERY STATE",
+            "track_history.py",
+            run_id,
         )
 
         status = "SUCCESS"
         failed_step = None
 
     except subprocess.CalledProcessError as error:
-
         status = "FAILED"
 
         error_message = (
@@ -158,9 +250,7 @@ def main():
         )
 
     except Exception as error:
-
         status = "FAILED"
-
         error_message = str(error)
 
     finished_at = utc_now()
@@ -168,10 +258,6 @@ def main():
     duration = (
         finished_at - started_at
     ).total_seconds()
-
-    # -------------------------
-    # SAVE RUN LOG
-    # -------------------------
 
     run_record = {
         "run_id": run_id,
@@ -189,13 +275,15 @@ def main():
         "error_message": error_message
     }
 
+    # Local fallback log
     append_run_log(
         run_record
     )
 
-    # -------------------------
-    # FINAL OUTPUT
-    # -------------------------
+    # BigQuery run log
+    write_run_log_to_bigquery(
+        run_record
+    )
 
     print("\n" + "=" * 60)
 
@@ -228,12 +316,11 @@ def main():
     )
 
     print(
-        f"Run log saved to:\n"
+        f"Local fallback run log:\n"
         f"{RUN_LOG_PATH}"
     )
 
     if status == "FAILED":
-
         print(
             f"Failed step: {failed_step}"
         )

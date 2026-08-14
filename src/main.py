@@ -13,6 +13,8 @@ CONFIG_PATH = ROOT_DIR / "config" / "search_config.json"
 OUTPUT_PATH = ROOT_DIR / "data" / "raw_jobs.json"
 ADZUNA_API_BASE_URL = "https://api.adzuna.com/v1/api/jobs"
 REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_RESULTS_PER_PAGE = 50
+DEFAULT_MAX_PAGES = 1
 
 COUNTRY_CODES = {
     "australia": "au", "austria": "at", "belgium": "be", "brazil": "br",
@@ -59,11 +61,14 @@ def sanitize_job_url(url):
 
 def normalize_job(job):
     category = job.get("category")
+    location = job.get("location")
+    location_area = location.get("area", []) if isinstance(location, dict) else []
     return {
         "job_id": str(job["id"]) if job.get("id") is not None else None,
         "title": job.get("title"),
         "company": nested_display_name(job, "company"),
         "location": nested_display_name(job, "location"),
+        "location_area": [str(item) for item in location_area if item],
         "posted_date": job.get("created"),
         "salary_min": job.get("salary_min"),
         "salary_max": job.get("salary_max"),
@@ -73,6 +78,123 @@ def normalize_job(job):
         "source": "Adzuna",
         "job_url": sanitize_job_url(job.get("redirect_url")),
     }
+
+
+def positive_integer(config, field, default):
+    value = config.get(field, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"Configuration field '{field}' must be a positive integer.")
+    return value
+
+
+def request_page(country, page, params, request_get=None):
+    request_get = request_get or requests.get
+    url = f"{ADZUNA_API_BASE_URL}/{country_code(country)}/search/{page}"
+
+    print(f"Requesting Adzuna page {page}...")
+
+    try:
+        response = request_get(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.Timeout as error:
+        raise RuntimeError(
+            f"Adzuna page {page} timed out after "
+            f"{REQUEST_TIMEOUT_SECONDS} seconds."
+        ) from error
+    except requests.RequestException as error:
+        # Exception text can include the prepared URL and credentials.
+        raise RuntimeError(
+            f"Adzuna page {page} failed due to a network error."
+        ) from error
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Adzuna page {page} returned HTTP {response.status_code}. "
+            "Check the credentials, configuration, and API availability."
+        )
+
+    try:
+        payload = response.json()
+    except requests.JSONDecodeError as error:
+        raise RuntimeError(
+            f"Adzuna page {page} returned invalid JSON."
+        ) from error
+
+    results = payload.get("results", [])
+    if not isinstance(results, list):
+        raise RuntimeError(
+            f"Adzuna page {page} returned an invalid results payload."
+        )
+
+    print(f"Received {len(results)} jobs.")
+    return results
+
+
+def fetch_all_jobs(config, app_id, app_key, request_get=None):
+    results_per_page = positive_integer(
+        config,
+        "results_per_page",
+        DEFAULT_RESULTS_PER_PAGE,
+    )
+    max_pages = positive_integer(config, "max_pages", DEFAULT_MAX_PAGES)
+    params = {
+        "app_id": app_id,
+        "app_key": app_key,
+        "what": config["role"],
+        "where": config["location"],
+        "results_per_page": results_per_page,
+        "content-type": "application/json",
+    }
+
+    all_results = []
+    pages_fetched = 0
+
+    for page in range(1, max_pages + 1):
+        page_results = request_page(
+            config["country"],
+            page,
+            params,
+            request_get=request_get,
+        )
+        pages_fetched += 1
+
+        if not page_results:
+            if page == 1:
+                raise RuntimeError(
+                    f"Adzuna returned no jobs for role '{config['role']}' "
+                    f"in '{config['location']}, {config['country']}'."
+                )
+            print(f"Page {page} was empty; pagination complete.")
+            break
+
+        all_results.extend(page_results)
+
+        if len(page_results) < results_per_page:
+            print(
+                f"Page {page} returned fewer than {results_per_page} jobs; "
+                "pagination complete."
+            )
+            break
+
+    return all_results, pages_fetched
+
+
+def deduplicate_jobs(jobs):
+    unique_jobs = []
+    seen_job_ids = set()
+
+    for job in jobs:
+        job_id = job.get("job_id")
+        if job_id and job_id in seen_job_ids:
+            continue
+        if job_id:
+            seen_job_ids.add(job_id)
+        unique_jobs.append(job)
+
+    return unique_jobs
 
 
 def main():
@@ -92,49 +214,27 @@ def main():
     country = config["country"]
     location = config["location"]
     role = config["role"]
-    url = f"{ADZUNA_API_BASE_URL}/{country_code(country)}/search/1"
-    params = {
-        "app_id": app_id,
-        "app_key": app_key,
-        "what": role,
-        "where": location,
-        "results_per_page": 50,
-        "content-type": "application/json",
-    }
+    results_per_page = positive_integer(
+        config, "results_per_page", DEFAULT_RESULTS_PER_PAGE
+    )
+    max_pages = positive_integer(config, "max_pages", DEFAULT_MAX_PAGES)
 
     print("Requesting jobs from Adzuna...")
     print(f"Country: {country}")
     print(f"Role: {role}")
     print(f"Location: {location}")
+    print(f"Results per page: {results_per_page}")
+    print(f"Maximum pages: {max_pages}")
 
-    try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-    except requests.Timeout as error:
-        raise RuntimeError(
-            f"Adzuna request timed out after {REQUEST_TIMEOUT_SECONDS} seconds."
-        ) from error
-    except requests.RequestException as error:
-        # Request exception text can contain the prepared URL and its credentials.
-        raise RuntimeError("Adzuna request failed due to a network error.") from error
+    results, pages_fetched = fetch_all_jobs(config, app_id, app_key)
+    normalized_jobs = [normalize_job(job) for job in results]
+    jobs = deduplicate_jobs(normalized_jobs)
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Adzuna API returned HTTP {response.status_code}. "
-            "Check the credentials, configuration, and API availability."
-        )
+    print(f"Pages fetched: {pages_fetched}")
+    print(f"Total raw jobs before deduplication: {len(normalized_jobs)}")
+    print(f"Unique raw jobs: {len(jobs)}")
+    print(f"Duplicates removed: {len(normalized_jobs) - len(jobs)}")
 
-    try:
-        payload = response.json()
-    except requests.JSONDecodeError as error:
-        raise RuntimeError("Adzuna API returned an invalid JSON response.") from error
-
-    results = payload.get("results", [])
-    if not results:
-        raise RuntimeError(
-            f"Adzuna returned no jobs for role '{role}' in '{location}, {country}'."
-        )
-
-    jobs = [normalize_job(job) for job in results]
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as file:
         json.dump(jobs, file, ensure_ascii=False, indent=2)
