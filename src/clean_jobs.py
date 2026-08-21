@@ -9,6 +9,8 @@ RAW_PATH = ROOT_DIR / "data" / "raw_jobs.json"
 CLEAN_PATH = ROOT_DIR / "data" / "clean_jobs.json"
 CONFIG_PATH = ROOT_DIR / "config" / "search_config.json"
 
+TORONTO_LOCATION_COMPONENTS = {"toronto", "city of toronto"}
+
 
 def parse_location(location, default_country):
     """
@@ -88,6 +90,58 @@ def parse_location(location, default_country):
     }
 
 
+def normalized_components(values):
+    return {
+        str(value).strip().casefold()
+        for value in values
+        if str(value).strip()
+    }
+
+
+def is_toronto_location(location, location_area):
+    """Recognize Toronto using exact structured or display-name components."""
+    area_components = normalized_components(location_area or [])
+    if area_components & TORONTO_LOCATION_COMPONENTS:
+        return True
+
+    display_components = normalized_components(
+        str(location or "").split(",")
+    )
+    return bool(display_components & TORONTO_LOCATION_COMPONENTS)
+
+
+def find_component(location_area, expected_values):
+    expected = {value.casefold() for value in expected_values}
+    for value in location_area or []:
+        if str(value).strip().casefold() in expected:
+            return str(value).strip()
+    return None
+
+
+def normalize_job_location(job, config):
+    location = job.get("location")
+    location_area = job.get("location_area") or []
+    target_location = config["location"].strip()
+    default_country = config["country"].strip()
+
+    if (
+        target_location.casefold() == "toronto"
+        and is_toronto_location(location, location_area)
+    ):
+        country = find_component(location_area, {"Canada"}) or default_country
+        province = find_component(location_area, {"Ontario", "ON"}) or "Ontario"
+        if province.casefold() == "on":
+            province = "Ontario"
+
+        return {
+            "city": "Toronto",
+            "province": province,
+            "country": country,
+        }
+
+    return parse_location(location, default_country)
+
+
 def load_json(path):
     """
     Load a JSON file.
@@ -120,10 +174,7 @@ def main():
 
     for job in raw_jobs:
 
-        parsed_location = parse_location(
-            job.get("location"),
-            config["country"]
-        )
+        parsed_location = normalize_job_location(job, config)
 
         clean_job = {
             "job_id": job.get("job_id"),

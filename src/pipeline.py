@@ -1,9 +1,27 @@
 import json
+import os
 import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from dotenv import load_dotenv
+from google.cloud import bigquery
+
+from pipeline_config import (
+    PIPELINE_RUN_ID_ENV,
+    PROJECT_ID,
+    get_auto_transform,
+    get_quality_publish_threshold,
+)
+from run_control import (
+    mark_extract_failed,
+    mark_raw_loaded,
+    mark_transform_submission_failed,
+    start_ingestion_run,
+)
+from submit_elt_transform import submit_elt_transform
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -22,9 +40,6 @@ def utc_now():
 
 
 def load_record_count(path):
-    """
-    Return the number of records in a JSON array.
-    """
     if not path.exists():
         return 0
 
@@ -42,9 +57,11 @@ def load_record_count(path):
 
 
 def append_run_log(record):
-    """
-    Append one pipeline run record as a JSON line.
-    """
+    RUN_LOG_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
     with open(RUN_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(
             json.dumps(
@@ -55,13 +72,13 @@ def append_run_log(record):
         )
 
 
-def run_step(step_name, script_name):
-    """
-    Run one pipeline step.
+def subprocess_environment(run_id):
+    environment = os.environ.copy()
+    environment[PIPELINE_RUN_ID_ENV] = run_id
+    return environment
 
-    If the step fails, stop the entire pipeline.
-    """
 
+def run_step(step_name, script_name, run_id):
     script_path = SRC_DIR / script_name
 
     print("\n" + "=" * 60)
@@ -70,23 +87,59 @@ def run_step(step_name, script_name):
 
     subprocess.run(
         [PYTHON, str(script_path)],
-        check=True
+        check=True,
+        env=subprocess_environment(run_id),
     )
 
     print(f"\n[OK] {step_name} completed")
 
 
+def write_run_log_to_bigquery(run_record):
+    print("\n" + "=" * 60)
+    print("STEP: BIGQUERY RUN LOG")
+    print("=" * 60)
+
+    try:
+        subprocess.run(
+            [
+                PYTHON,
+                str(SRC_DIR / "log_run_bigquery.py"),
+                json.dumps(run_record)
+            ],
+            check=True,
+            env=subprocess_environment(run_record["run_id"]),
+        )
+
+        print(
+            "\n[OK] BIGQUERY RUN LOG completed"
+        )
+
+    except subprocess.CalledProcessError as error:
+        print(
+            "\n[WARNING] Failed to write pipeline run "
+            "log to BigQuery."
+        )
+
+        print(
+            f"Logging process exited with code "
+            f"{error.returncode}."
+        )
+
+
 def main():
-
+    load_dotenv(ROOT_DIR / ".env")
     run_id = str(uuid.uuid4())
-
     started_at = utc_now()
 
-    status = "RUNNING"
+    status = "EXTRACTING"
     error_message = None
     failed_step = None
+    control_started = False
+
     records_extracted = 0
     records_clean = 0
+    publish_threshold = get_quality_publish_threshold()
+    auto_transform = get_auto_transform()
 
     print("\nJOB MARKET DATA PIPELINE")
     print("=" * 60)
@@ -99,6 +152,14 @@ def main():
     )
 
     try:
+        control_client = bigquery.Client(project=PROJECT_ID)
+        start_ingestion_run(
+            control_client,
+            run_id,
+            started_at,
+            publish_threshold,
+        )
+        control_started = True
 
         # -------------------------
         # STEP 1: EXTRACT
@@ -108,49 +169,38 @@ def main():
 
         run_step(
             "EXTRACT",
-            "main.py"
+            "main.py",
+            run_id,
         )
 
-        # Count only after this run's extraction step succeeds. If extraction
-        # fails, the metric remains zero instead of reading a stale raw file.
         records_extracted = load_record_count(
             RAW_PATH
         )
 
         # -------------------------
-        # STEP 2: CLEAN
+        # STEP 2: BIGQUERY RAW
         # -------------------------
 
-        failed_step = "CLEAN"
+        failed_step = "BIGQUERY_RAW"
 
         run_step(
-            "CLEAN",
-            "clean_jobs.py"
+            "BIGQUERY RAW",
+            "load_raw_bigquery.py",
+            run_id,
         )
 
-        # Count only after this run's cleaning step succeeds. If cleaning is
-        # skipped or fails, a previous clean dataset is not counted.
-        records_clean = load_record_count(
-            CLEAN_PATH
+        mark_raw_loaded(
+            control_client,
+            run_id,
+            utc_now(),
+            records_extracted,
         )
 
-        # -------------------------
-        # STEP 3: HISTORICAL TRACKING
-        # -------------------------
-
-        failed_step = "HISTORICAL_TRACKING"
-
-        run_step(
-            "HISTORICAL TRACKING",
-            "track_history.py"
-        )
-
-        status = "SUCCESS"
+        status = "RAW_LOADED"
         failed_step = None
 
     except subprocess.CalledProcessError as error:
-
-        status = "FAILED"
+        status = "EXTRACT_FAILED"
 
         error_message = (
             f"Step {failed_step} failed "
@@ -158,20 +208,60 @@ def main():
         )
 
     except Exception as error:
-
-        status = "FAILED"
-
+        status = "EXTRACT_FAILED"
         error_message = str(error)
+
+    if status == "EXTRACT_FAILED" and control_started:
+        try:
+            mark_extract_failed(
+                control_client,
+                run_id,
+                utc_now(),
+                error_message,
+            )
+        except Exception as control_error:
+            print(
+                "[WARNING] Failed to record extraction failure in run control: "
+                f"{control_error}"
+            )
+
+    if status == "RAW_LOADED" and auto_transform:
+        failed_step = "TRANSFORM_SUBMISSION"
+        try:
+            transform_job_id, submitted = submit_elt_transform(
+                control_client,
+                run_id,
+            )
+            status = (
+                "TRANSFORM_SUBMITTED"
+                if submitted
+                else "TRANSFORM_ALREADY_SUBMITTED"
+            )
+            failed_step = None
+            print(f"BigQuery transform job ID: {transform_job_id}")
+        except Exception as error:
+            status = "ORCHESTRATION_SUBMIT_FAILED"
+            error_message = (
+                "ORCHESTRATION SUBMIT_FAILED: "
+                f"{type(error).__name__}"
+            )
+            try:
+                mark_transform_submission_failed(
+                    control_client,
+                    run_id,
+                    error_message,
+                )
+            except Exception as control_error:
+                print(
+                    "[WARNING] Failed to record transform submission failure: "
+                    f"{type(control_error).__name__}"
+                )
 
     finished_at = utc_now()
 
     duration = (
         finished_at - started_at
     ).total_seconds()
-
-    # -------------------------
-    # SAVE RUN LOG
-    # -------------------------
 
     run_record = {
         "run_id": run_id,
@@ -189,20 +279,28 @@ def main():
         "error_message": error_message
     }
 
+    # Local fallback log
     append_run_log(
         run_record
     )
 
-    # -------------------------
-    # FINAL OUTPUT
-    # -------------------------
+    # BigQuery run log
+    write_run_log_to_bigquery(
+        run_record
+    )
 
     print("\n" + "=" * 60)
 
-    if status == "SUCCESS":
-        print("PIPELINE SUCCESS")
+    if status == "RAW_LOADED":
+        print("INGESTION RAW_LOADED")
+    elif status == "TRANSFORM_SUBMITTED":
+        print("ORCHESTRATION TRANSFORM_SUBMITTED")
+    elif status == "TRANSFORM_ALREADY_SUBMITTED":
+        print("ORCHESTRATION TRANSFORM_ALREADY_SUBMITTED")
+    elif status == "ORCHESTRATION_SUBMIT_FAILED":
+        print("ORCHESTRATION SUBMIT_FAILED")
     else:
-        print("PIPELINE FAILED")
+        print("INGESTION EXTRACT_FAILED")
 
     print("=" * 60)
 
@@ -228,12 +326,11 @@ def main():
     )
 
     print(
-        f"Run log saved to:\n"
+        f"Local fallback run log:\n"
         f"{RUN_LOG_PATH}"
     )
 
-    if status == "FAILED":
-
+    if status in {"EXTRACT_FAILED", "ORCHESTRATION_SUBMIT_FAILED"}:
         print(
             f"Failed step: {failed_step}"
         )

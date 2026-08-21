@@ -1,103 +1,329 @@
 # Job Market Data Pipeline
 
-A Python end-to-end pipeline that collects job postings from the Adzuna Jobs API, normalizes them, tracks their history, and logs every pipeline run.
+This project extracts Toronto job postings from the Adzuna Jobs API and stores
+them in BigQuery. The active architecture is warehouse-native ELT: Python (and
+the Cloud Run Job that hosts it) performs ingestion only, while BigQuery owns
+deduplication, cleaning, quality scoring, current/history maintenance, and the
+publish gate.
 
-## Current Pipeline
+The migration reduces Python/Cloud Run transformation work. It does not imply
+automatic cost savings: BigQuery queries must remain scoped to one `run_id`.
 
-```text
-Adzuna Jobs API
-  -> Extract to raw JSON
-  -> Clean and normalize
-  -> Historical tracking
-  -> Pipeline run logging
-```
-
-The current implementation runs locally. Google Cloud Run and BigQuery are planned architecture and are not yet implemented.
-
-## Features
-
-- Configurable country, location, and role in `config/search_config.json`
-- Adzuna credentials supplied only through environment variables
-- Raw and clean JSON data layers
-- Location and field normalization
-- API-provided stable job IDs
-- Historical state with `first_seen_at`, `last_seen_at`, and `is_active`
-- Append-only job observations in `data/job_observations.jsonl`
-- Fail-fast pipeline orchestration and run logging in `data/pipeline_runs.jsonl`
-
-## Project Structure
+## Architecture
 
 ```text
-job-market-pipeline/
-|-- config/
-|   `-- search_config.json
-|-- src/
-|   |-- main.py
-|   |-- clean_jobs.py
-|   |-- track_history.py
-|   `-- pipeline.py
-|-- data/                 # generated pipeline outputs
-|-- requirements.txt
-|-- .gitignore
-`-- README.md
+Adzuna API
+    -> Python pagination and provenance
+    -> BigQuery raw_jobs (append-only)
+    -> extract_status = RAW_LOADED
+    -> optionally submit one asynchronous BigQuery CALL when AUTO_TRANSFORM=true
+    -> Cloud Run ends
+
+manual or optional automatic trigger
+    -> CALL job_market.process_job_run(run_id)
+    -> BigQuery deduplication and Toronto normalization
+    -> row and run data-quality calculations
+    -> curated_jobs + jobs_current
+    -> job_observations + jobs_state
+    -> published_jobs view
+    -> transform_status = SUCCESS
 ```
 
-## Configuration
+`python src/pipeline.py` no longer runs Python business transformations. It
+generates one UUID, calls Adzuna sequentially, writes the local transient RAW
+file, appends it to BigQuery, and records `RAW_LOADED`. With `AUTO_TRANSFORM`
+disabled it then exits. When enabled, it submits one asynchronous BigQuery
+routine job, records its job ID, and exits without waiting. Cloud Run success
+means ingestion succeeded and, when enabled, submission succeeded; it never
+means the warehouse transformation completed. `transform_status` is
+authoritative for the final result.
 
-`config/search_config.json`:
+The stable Python transformation modules remain in `src/` for migration
+comparison and rollback analysis, but they are not called by the active path.
+
+## Ingestion and RAW
+
+Search settings are in `config/search_config.json`:
 
 ```json
 {
   "country": "Canada",
   "location": "Toronto",
-  "role": "Data Analyst"
+  "role": "Data Analyst",
+  "results_per_page": 50,
+  "max_pages": 3
 }
 ```
 
-The country can be a supported country name or a two-letter Adzuna country code such as `ca`.
+Pages are requested sequentially. Pagination stops at `max_pages`, an empty
+later page, or a page smaller than `results_per_page`. Any requested-page
+failure fails the entire ingestion; a partial result is never marked
+`RAW_LOADED`.
 
-Create a local `.env` file (already ignored by Git):
+`raw_jobs` remains append-only and keeps its legacy columns. Additive ELT
+provenance columns are:
+
+- `source_job_id`
+- `page_number`
+- `position_in_page`
+- `search_role`
+- `search_location`
+- `raw_payload` as BigQuery `JSON`
+
+Every source result is retained, including repeated Adzuna IDs across pages.
+Cross-page deduplication no longer occurs before RAW persistence. The source
+payload is preserved except that client-attribution query data is removed from
+redirect URLs so local credential identifiers are not persisted.
+
+The Cloud Run filesystem is ephemeral. `data/raw_jobs.json` is a transient
+staging artifact; BigQuery is the persistent RAW layer.
+
+## BigQuery transformation
+
+Repository SQL is organized as:
+
+```text
+sql/
+  setup/001_elt_resources.sql
+  routines/job_run_rows.sql
+  routines/process_job_run.sql
+  views/published_jobs.sql
+  tests/job_quality_assertions.sql
+```
+
+`job_run_rows` is a parameterized table function used for shadow parity and by
+the stored procedure. `process_job_run` is the central warehouse API:
+
+```sql
+CALL `weekly-market-trend.job_market.process_job_run`('<run-id>');
+```
+
+For the specified run only, it:
+
+1. validates exactly one run-control record, `RAW_LOADED` extraction, a
+   non-empty RAW batch, and agreement between recorded and actual RAW counts;
+2. counts RAW rows, unique source IDs, and upstream duplicate rows;
+3. deterministically deduplicates source IDs by page, position, and ingestion
+   time;
+4. reads source values from `raw_payload`, with legacy RAW-column fallbacks;
+5. recognizes and normalizes exact Toronto components;
+6. calculates row scores, flags, status, and publishability;
+7. transactionally replaces `curated_jobs` and `jobs_current` current
+   snapshots;
+8. replaces only the same run's `job_observations`, making retries idempotent;
+9. merges identified jobs into `jobs_state`;
+10. replaces only the same run's `data_quality_runs` record; and
+11. records transformation counts and `SUCCESS` in `job_run_control`.
+
+If transformation fails, its transaction is rolled back, RAW is retained, and
+the control record becomes `TRANSFORM_FAILED`. The same RAW run can be retried.
+The original `transform_started_at` is reused on retry, so observation and
+state timestamps do not drift.
+
+## Toronto normalization
+
+Structured `location.area` is preferred. An exact `Toronto` or
+`City of Toronto` hierarchy component normalizes to:
+
+```text
+city = Toronto
+province = Ontario
+country = Canada
+```
+
+Exact comma-separated display components are the legacy-data fallback. This
+handles Toronto, North York, Etobicoke, Toronto Dominion Centre, Harbourfront,
+and Union Station when the source hierarchy identifies Toronto. It does not
+use substring or proximity matching, and it does not broaden the search to
+Mississauga, Brampton, Markham, Vaughan, or Richmond Hill.
+
+## Data quality and publish gate
+
+The stable Python scoring formula is reproduced in SQL.
+
+Completeness contributes 50 points: `job_id` 10, `title` 10, `company` 8,
+`city` 6, `province` 4, `country` 4, `posted_date` 4, and `description` 4.
+
+Validity contributes 30 points: parseable date 8, date no more than one day in
+the future 4, salary validity 6, usable HTTP/HTTPS URL 6, and populated source
+6. Missing salary still receives all six salary-validity points. A suspicious
+salary receives three; an invalid min/max range receives zero.
+
+Timeliness contributes 20 points for 0–30 days, 16 for 31–60, 12 for 61–90,
+6 for 91–180, and 0 beyond 180 days or for an unreasonable future/invalid
+date.
+
+Statuses remain:
+
+- `PASS`: score >= 80
+- `REVIEW`: score >= 60 and < 80
+- `FAIL`: score < 60
+
+The default publish threshold is 80. A row publishes only when it reaches the
+threshold, has no hard-failure flag, and is no more than 180 days old. The
+hard flags are `MISSING_CRITICAL_FIELD`, `INVALID_POSTED_DATE`,
+`FUTURE_POSTED_DATE`, and `INVALID_SALARY_RANGE`. A row older than 180 days
+stays in `curated_jobs`, keeps `STALE_JOB`, and can retain `PASS`; the age rule
+does not alter its score.
+
+Run-level completeness, validity, uniqueness, and timeliness percentages are
+calculated in BigQuery. The overall score remains:
+
+```text
+completeness * 40%
++ validity * 30%
++ uniqueness * 15%
++ timeliness * 15%
+```
+
+Uniqueness now measures the upstream RAW observations before SQL deduplication,
+which is an intentional ELT observability improvement.
+
+## Warehouse resources and semantics
+
+- `raw_jobs`: append-only source history with `run_id` lineage
+- `curated_jobs`: current scored snapshot
+- `published_jobs`: view over publishable curated rows
+- `jobs_current`: current cleaned snapshot
+- `job_observations`: append-only across runs and retry-safe within a run
+- `jobs_state`: one state row per identified job
+- `pipeline_runs`: append-only ingestion execution log
+- `data_quality_runs`: one retry-safe quality record per transformed run
+- `job_run_control`: separate extraction/transformation lifecycle
+
+`jobs_state.first_seen_at` is preserved for existing IDs; `last_seen_at` is
+updated when the current run sees an ID. Missing jobs are not automatically
+deactivated because absence from the configured Adzuna pages is not proof that
+a job is inactive.
+
+Run-control statuses are separate:
+
+```text
+EXTRACTING -> RAW_LOADED
+                    -> TRANSFORMING -> SUCCESS
+EXTRACT_FAILED         TRANSFORM_FAILED
+```
+
+`job_run_control` is partitioned by `DATE(started_at)` and clustered by
+`run_id`, `extract_status`, and `transform_status`.
+
+## Cost controls
+
+Every RAW read in the transformation includes `WHERE run_id = requested_run_id`.
+The existing production tables were unpartitioned and unclustered, and this
+migration does not destructively recreate them. Consequently BigQuery may
+still scan more storage than ideal even with run predicates. A future table
+migration should consider:
+
+```sql
+PARTITION BY DATE(ingested_at)
+CLUSTER BY run_id, source_job_id
+```
+
+for RAW, plus an appropriate append-oriented curated design if warehouse
+semantics are later redesigned. That physical migration is intentionally not
+performed here.
+
+## Configuration and local credentials
+
+Create an ignored `.env` file in the project root:
 
 ```dotenv
 ADZUNA_APP_ID=your_app_id
 ADZUNA_APP_KEY=your_app_key
+# Optional; defaults to 80
+QUALITY_PUBLISH_THRESHOLD=80
+# Optional; defaults to false. Accepted true values: true, 1, yes
+AUTO_TRANSFORM=false
 ```
 
-Environment variables provided by the runtime take precedence, which makes the same code suitable for later deployment to Cloud Run.
+BigQuery uses Application Default Credentials locally. Cloud Run continues to
+use its runtime service account. API credentials must not be committed, logged,
+or placed in SQL.
 
-## Run Locally
-
-PowerShell:
+## Install and run locally
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python src\pipeline.py
+gcloud auth application-default login
 ```
 
-The pipeline stops immediately if extraction, cleaning, or historical tracking fails, and writes the outcome to `data/pipeline_runs.jsonl`.
+Install or update the additive schema, routines, and publish view:
 
-## Generated Data
-
-- `data/raw_jobs.json`: normalized Adzuna extraction output
-- `data/clean_jobs.json`: cleaned records matching the configured location
-- `data/job_state.json`: latest known state of every observed job
-- `data/job_observations.jsonl`: append-only observation history
-- `data/pipeline_runs.jsonl`: pipeline execution history
-
-## Migration from Canada Job Bank
-
-Adzuna's API `id` is now used directly as `job_id`; IDs are no longer parsed from Job Bank URLs. Salary is represented by `salary_min` and `salary_max`, and clean records now also retain description, category, and contract type. Existing Job Bank state and observations are not rewritten; if retained, they remain historical records alongside newly collected Adzuna records.
-
-## Planned Architecture
-
-```text
-Cloud Scheduler
-  -> Google Cloud Run (planned)
-  -> Python pipeline
-  -> BigQuery (planned)
-  -> BI/dashboard layer (planned)
+```powershell
+.\.venv\Scripts\python.exe src\install_elt_sql.py
 ```
 
-Planned work includes Cloud Run deployment, BigQuery storage, scheduling, cloud logging and monitoring, pagination, and dashboards.
+Run ingestion with the default manual-transform behavior:
+
+```powershell
+.\.venv\Scripts\python.exe src\pipeline.py
+```
+
+Copy the printed run ID, then transform it with either BigQuery SQL:
+
+```sql
+CALL `weekly-market-trend.job_market.process_job_run`('<run-id>');
+```
+
+or the optional local manual wrapper:
+
+```powershell
+.\.venv\Scripts\python.exe src\run_elt_transform.py <run-id>
+```
+
+The wrapper submits only the single warehouse routine; it does not execute
+business transformations in Python and is not called by the active ingestion
+path.
+
+Set `AUTO_TRANSFORM=true` to have the ingestion process submit that same
+parameterized `CALL` automatically after `RAW_LOADED`. Submission is
+asynchronous: Python records `transform_job_id` but never waits for completion.
+If a job ID is already recorded for the run, it is reused and a duplicate CALL
+is not submitted. Check `job_run_control.transform_status` for the authoritative
+transformation result.
+
+Run tests and parity validation:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe src\validate_elt_parity.py <captured-stable-run-id>
+```
+
+Build the Cloud Run-compatible Linux container locally:
+
+```powershell
+docker build -t job-market-pipeline .
+```
+
+## Optional orchestration (not deployed)
+
+No Scheduler, IAM, service-account, Secret Manager, or Cloud Run configuration
+is created by this repository change.
+
+The optional Cloud Run submission path is implemented behind
+`AUTO_TRANSFORM=false`. A separate future trigger remains possible:
+
+1. Implemented but disabled: after RAW load, Cloud Run submits one BigQuery job containing only
+   `CALL process_job_run(run_id)`. This avoids a timing race and starts promptly
+   while keeping all transformation compute inside BigQuery.
+2. A BigQuery Scheduled Query finds `RAW_LOADED`/`PENDING` runs and calls the
+   procedure. This separates ingestion and warehouse scheduling but adds
+   polling latency, locking, and a second scheduler configuration.
+
+The first option remains disabled until Cloud Run configuration is separately
+authorized. Neither option changes where transformation compute executes.
+
+## Known limitations
+
+- `max_pages` limits source coverage; this is not complete Toronto-market data.
+- Adzuna ranking changes can move jobs outside the configured pages.
+- Salary and contract type coverage are source-limited.
+- Existing production data tables remain unpartitioned/unclustered.
+- Absence does not trigger `is_active = FALSE`.
+- Current-snapshot table semantics are preserved rather than redesigned.
+- Manual operators must avoid transforming older runs out of order; future
+  automation should claim pending runs and serialize current-snapshot writes.
+- Scheduler/orchestration and downstream BI integration are not deployed.
