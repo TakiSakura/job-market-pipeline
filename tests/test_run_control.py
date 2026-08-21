@@ -57,6 +57,26 @@ class RunControlTests(unittest.TestCase):
         self.assertIn("raw_loaded_at = NULL", sql)
         self.assertNotIn("RAW_LOADED", sql)
 
+    def test_submission_failure_preserves_raw_loaded_and_pending(self):
+        client = self.client()
+        run_control.mark_transform_submission_failed(
+            client,
+            "run-1",
+            "ORCHESTRATION SUBMIT_FAILED: RuntimeError",
+        )
+
+        sql = client.query.call_args.args[0]
+        self.assertIn("AND transform_status = 'PENDING'", sql)
+        self.assertNotIn("SET transform_status", sql)
+        self.assertIn("extract_status = 'RAW_LOADED'", sql)
+        self.assertNotIn("EXTRACT_FAILED", sql)
+        parameters = client.query.call_args.kwargs["job_config"].query_parameters
+        values = {parameter.name: parameter.value for parameter in parameters}
+        self.assertEqual(
+            values["error_message"],
+            "ORCHESTRATION SUBMIT_FAILED: RuntimeError",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

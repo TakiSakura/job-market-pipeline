@@ -6,14 +6,22 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
 from google.cloud import bigquery
 
 from pipeline_config import (
     PIPELINE_RUN_ID_ENV,
     PROJECT_ID,
+    get_auto_transform,
     get_quality_publish_threshold,
 )
-from run_control import mark_extract_failed, mark_raw_loaded, start_ingestion_run
+from run_control import (
+    mark_extract_failed,
+    mark_raw_loaded,
+    mark_transform_submission_failed,
+    start_ingestion_run,
+)
+from submit_elt_transform import submit_elt_transform
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -119,6 +127,7 @@ def write_run_log_to_bigquery(run_record):
 
 
 def main():
+    load_dotenv(ROOT_DIR / ".env")
     run_id = str(uuid.uuid4())
     started_at = utc_now()
 
@@ -130,6 +139,7 @@ def main():
     records_extracted = 0
     records_clean = 0
     publish_threshold = get_quality_publish_threshold()
+    auto_transform = get_auto_transform()
 
     print("\nJOB MARKET DATA PIPELINE")
     print("=" * 60)
@@ -215,6 +225,38 @@ def main():
                 f"{control_error}"
             )
 
+    if status == "RAW_LOADED" and auto_transform:
+        failed_step = "TRANSFORM_SUBMISSION"
+        try:
+            transform_job_id, submitted = submit_elt_transform(
+                control_client,
+                run_id,
+            )
+            status = (
+                "TRANSFORM_SUBMITTED"
+                if submitted
+                else "TRANSFORM_ALREADY_SUBMITTED"
+            )
+            failed_step = None
+            print(f"BigQuery transform job ID: {transform_job_id}")
+        except Exception as error:
+            status = "ORCHESTRATION_SUBMIT_FAILED"
+            error_message = (
+                "ORCHESTRATION SUBMIT_FAILED: "
+                f"{type(error).__name__}"
+            )
+            try:
+                mark_transform_submission_failed(
+                    control_client,
+                    run_id,
+                    error_message,
+                )
+            except Exception as control_error:
+                print(
+                    "[WARNING] Failed to record transform submission failure: "
+                    f"{type(control_error).__name__}"
+                )
+
     finished_at = utc_now()
 
     duration = (
@@ -251,6 +293,12 @@ def main():
 
     if status == "RAW_LOADED":
         print("INGESTION RAW_LOADED")
+    elif status == "TRANSFORM_SUBMITTED":
+        print("ORCHESTRATION TRANSFORM_SUBMITTED")
+    elif status == "TRANSFORM_ALREADY_SUBMITTED":
+        print("ORCHESTRATION TRANSFORM_ALREADY_SUBMITTED")
+    elif status == "ORCHESTRATION_SUBMIT_FAILED":
+        print("ORCHESTRATION SUBMIT_FAILED")
     else:
         print("INGESTION EXTRACT_FAILED")
 
@@ -282,7 +330,7 @@ def main():
         f"{RUN_LOG_PATH}"
     )
 
-    if status == "EXTRACT_FAILED":
+    if status in {"EXTRACT_FAILED", "ORCHESTRATION_SUBMIT_FAILED"}:
         print(
             f"Failed step: {failed_step}"
         )

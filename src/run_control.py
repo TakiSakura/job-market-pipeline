@@ -110,6 +110,65 @@ def mark_extract_failed(client, run_id, failed_at, error_message):
     _run_query(client, query, run_id, failed_at, error_message=error_message)
 
 
+def get_transform_job_id(client, run_id):
+    query = f"""
+    SELECT transform_job_id
+    FROM `{table_id()}`
+    WHERE run_id = @run_id
+    """
+    config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
+        ]
+    )
+    rows = list(
+        client.query(
+            query,
+            job_config=config,
+            location=BIGQUERY_LOCATION,
+        ).result()
+    )
+    if len(rows) != 1:
+        raise RuntimeError(
+            "Expected exactly one run-control row before transform submission."
+        )
+    return rows[0]["transform_job_id"]
+
+
+def record_transform_job_id(client, run_id, transform_job_id):
+    query = f"""
+    UPDATE `{table_id()}`
+    SET transform_job_id = @transform_job_id,
+        error_message = NULL
+    WHERE run_id = @run_id
+      AND extract_status = 'RAW_LOADED'
+    """
+    _run_query(
+        client,
+        query,
+        run_id,
+        event_at=None,
+        transform_job_id=transform_job_id,
+    )
+
+
+def mark_transform_submission_failed(client, run_id, error_message):
+    query = f"""
+    UPDATE `{table_id()}`
+    SET error_message = @error_message
+    WHERE run_id = @run_id
+      AND extract_status = 'RAW_LOADED'
+      AND transform_status = 'PENDING'
+    """
+    _run_query(
+        client,
+        query,
+        run_id,
+        event_at=None,
+        error_message=error_message,
+    )
+
+
 def _run_query(
     client,
     query,
@@ -118,6 +177,7 @@ def _run_query(
     raw_count=None,
     error_message=None,
     publish_threshold=None,
+    transform_job_id=None,
 ):
     parameters = [
         bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
@@ -142,6 +202,12 @@ def _run_query(
         parameters.append(
             bigquery.ScalarQueryParameter(
                 "publish_threshold", "FLOAT64", publish_threshold
+            )
+        )
+    if "@transform_job_id" in query:
+        parameters.append(
+            bigquery.ScalarQueryParameter(
+                "transform_job_id", "STRING", transform_job_id
             )
         )
 

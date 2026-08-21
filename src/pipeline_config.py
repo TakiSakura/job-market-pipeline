@@ -9,6 +9,8 @@ PIPELINE_RUN_ID_ENV = "PIPELINE_RUN_ID"
 QUALITY_PUBLISH_THRESHOLD_ENV = "QUALITY_PUBLISH_THRESHOLD"
 DEFAULT_QUALITY_PUBLISH_THRESHOLD = 80.0
 RUN_CONTROL_TABLE = "job_run_control"
+AUTO_TRANSFORM_ENV = "AUTO_TRANSFORM"
+AUTO_TRANSFORM_TRUE_VALUES = {"1", "true", "yes"}
 
 
 def get_pipeline_run_id():
@@ -39,3 +41,9 @@ def get_quality_publish_threshold():
         )
 
     return threshold
+
+
+def get_auto_transform():
+    return os.getenv(AUTO_TRANSFORM_ENV, "false").strip().casefold() in (
+        AUTO_TRANSFORM_TRUE_VALUES
+    )

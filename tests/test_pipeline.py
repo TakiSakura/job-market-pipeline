@@ -25,6 +25,8 @@ class PipelineOrchestrationTests(unittest.TestCase):
             patch.object(pipeline.bigquery, "Client") as client_class,
             patch.object(pipeline, "start_ingestion_run") as start_run,
             patch.object(pipeline, "mark_raw_loaded") as mark_raw_loaded,
+            patch.object(pipeline, "get_auto_transform", return_value=False),
+            patch.object(pipeline, "submit_elt_transform") as submit_transform,
             patch.object(pipeline, "run_step", side_effect=record_step),
             patch.object(pipeline, "load_record_count", return_value=50),
             patch.object(pipeline, "append_run_log", side_effect=local_logs.append),
@@ -53,7 +55,75 @@ class PipelineOrchestrationTests(unittest.TestCase):
         self.assertIs(mark_raw_loaded.call_args.args[0], client_class.return_value)
         self.assertEqual(mark_raw_loaded.call_args.args[1], "shared-run-id")
         self.assertEqual(mark_raw_loaded.call_args.args[3], 50)
+        submit_transform.assert_not_called()
         self.assertIsNone(result)
+
+    def test_auto_transform_submits_once_and_exits_successfully(self):
+        local_logs = []
+
+        with (
+            patch.object(pipeline.uuid, "uuid4", return_value="auto-run-id"),
+            patch.object(pipeline.bigquery, "Client") as client_class,
+            patch.object(pipeline, "start_ingestion_run"),
+            patch.object(pipeline, "mark_raw_loaded"),
+            patch.object(pipeline, "get_auto_transform", return_value=True),
+            patch.object(
+                pipeline,
+                "submit_elt_transform",
+                return_value=("query-job-id", True),
+            ) as submit_transform,
+            patch.object(pipeline, "run_step"),
+            patch.object(pipeline, "load_record_count", return_value=50),
+            patch.object(pipeline, "append_run_log", side_effect=local_logs.append),
+            patch.object(pipeline, "write_run_log_to_bigquery"),
+        ):
+            result = pipeline.main()
+
+        submit_transform.assert_called_once_with(
+            client_class.return_value,
+            "auto-run-id",
+        )
+        self.assertEqual(local_logs[0]["status"], "TRANSFORM_SUBMITTED")
+        self.assertIsNone(result)
+
+    def test_transform_submission_failure_is_not_extraction_failure(self):
+        local_logs = []
+
+        with (
+            patch.object(pipeline.uuid, "uuid4", return_value="submit-failed-run"),
+            patch.object(pipeline.bigquery, "Client") as client_class,
+            patch.object(pipeline, "start_ingestion_run"),
+            patch.object(pipeline, "mark_raw_loaded") as mark_raw_loaded,
+            patch.object(pipeline, "mark_extract_failed") as mark_extract_failed,
+            patch.object(
+                pipeline,
+                "mark_transform_submission_failed",
+            ) as mark_submit_failed,
+            patch.object(pipeline, "get_auto_transform", return_value=True),
+            patch.object(
+                pipeline,
+                "submit_elt_transform",
+                side_effect=RuntimeError("unsafe detail"),
+            ),
+            patch.object(pipeline, "run_step"),
+            patch.object(pipeline, "load_record_count", return_value=50),
+            patch.object(pipeline, "append_run_log", side_effect=local_logs.append),
+            patch.object(pipeline, "write_run_log_to_bigquery"),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                pipeline.main()
+
+        mark_raw_loaded.assert_called_once()
+        mark_extract_failed.assert_not_called()
+        mark_submit_failed.assert_called_once_with(
+            client_class.return_value,
+            "submit-failed-run",
+            "ORCHESTRATION SUBMIT_FAILED: RuntimeError",
+        )
+        self.assertEqual(local_logs[0]["status"], "ORCHESTRATION_SUBMIT_FAILED")
+        self.assertEqual(local_logs[0]["failed_step"], "TRANSFORM_SUBMISSION")
+        self.assertNotIn("unsafe detail", local_logs[0]["error_message"])
+        self.assertEqual(raised.exception.code, 1)
 
     def test_extract_failure_does_not_count_stale_files(self):
         local_logs = []
@@ -63,6 +133,8 @@ class PipelineOrchestrationTests(unittest.TestCase):
             patch.object(pipeline.bigquery, "Client"),
             patch.object(pipeline, "start_ingestion_run"),
             patch.object(pipeline, "mark_extract_failed") as mark_failed,
+            patch.object(pipeline, "get_auto_transform", return_value=True),
+            patch.object(pipeline, "submit_elt_transform") as submit_transform,
             patch.object(
                 pipeline,
                 "run_step",
@@ -80,6 +152,7 @@ class PipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(local_logs[0]["records_clean"], 0)
         self.assertEqual(local_logs[0]["failed_step"], "EXTRACT")
         mark_failed.assert_called_once()
+        submit_transform.assert_not_called()
         self.assertEqual(raised.exception.code, 1)
 
     def test_raw_load_failure_retains_current_extract_count(self):
@@ -96,6 +169,8 @@ class PipelineOrchestrationTests(unittest.TestCase):
             patch.object(pipeline.bigquery, "Client"),
             patch.object(pipeline, "start_ingestion_run"),
             patch.object(pipeline, "mark_extract_failed") as mark_failed,
+            patch.object(pipeline, "get_auto_transform", return_value=True),
+            patch.object(pipeline, "submit_elt_transform") as submit_transform,
             patch.object(pipeline, "run_step", side_effect=run_step),
             patch.object(pipeline, "load_record_count", return_value=50),
             patch.object(pipeline, "append_run_log", side_effect=local_logs.append),
@@ -109,6 +184,7 @@ class PipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(local_logs[0]["failed_step"], "BIGQUERY_RAW")
         self.assertEqual(local_logs[0]["status"], "EXTRACT_FAILED")
         mark_failed.assert_called_once()
+        submit_transform.assert_not_called()
         self.assertEqual(raised.exception.code, 1)
 
 

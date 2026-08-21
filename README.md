@@ -15,9 +15,11 @@ automatic cost savings: BigQuery queries must remain scoped to one `run_id`.
 Adzuna API
     -> Python pagination and provenance
     -> BigQuery raw_jobs (append-only)
-    -> extract_status = RAW_LOADED; Cloud Run ends
+    -> extract_status = RAW_LOADED
+    -> optionally submit one asynchronous BigQuery CALL when AUTO_TRANSFORM=true
+    -> Cloud Run ends
 
-manual/future orchestration trigger
+manual or optional automatic trigger
     -> CALL job_market.process_job_run(run_id)
     -> BigQuery deduplication and Toronto normalization
     -> row and run data-quality calculations
@@ -29,9 +31,12 @@ manual/future orchestration trigger
 
 `python src/pipeline.py` no longer runs Python business transformations. It
 generates one UUID, calls Adzuna sequentially, writes the local transient RAW
-file, appends it to BigQuery, records `RAW_LOADED`, and exits. A successful
-Cloud Run execution therefore means ingestion succeeded; it does not mean the
-warehouse transformation succeeded.
+file, appends it to BigQuery, and records `RAW_LOADED`. With `AUTO_TRANSFORM`
+disabled it then exits. When enabled, it submits one asynchronous BigQuery
+routine job, records its job ID, and exits without waiting. Cloud Run success
+means ingestion succeeded and, when enabled, submission succeeded; it never
+means the warehouse transformation completed. `transform_status` is
+authoritative for the final result.
 
 The stable Python transformation modules remain in `src/` for migration
 comparison and rollback analysis, but they are not called by the active path.
@@ -228,6 +233,8 @@ ADZUNA_APP_ID=your_app_id
 ADZUNA_APP_KEY=your_app_key
 # Optional; defaults to 80
 QUALITY_PUBLISH_THRESHOLD=80
+# Optional; defaults to false. Accepted true values: true, 1, yes
+AUTO_TRANSFORM=false
 ```
 
 BigQuery uses Application Default Credentials locally. Cloud Run continues to
@@ -249,7 +256,7 @@ Install or update the additive schema, routines, and publish view:
 .\.venv\Scripts\python.exe src\install_elt_sql.py
 ```
 
-Run ingestion only:
+Run ingestion with the default manual-transform behavior:
 
 ```powershell
 .\.venv\Scripts\python.exe src\pipeline.py
@@ -271,6 +278,13 @@ The wrapper submits only the single warehouse routine; it does not execute
 business transformations in Python and is not called by the active ingestion
 path.
 
+Set `AUTO_TRANSFORM=true` to have the ingestion process submit that same
+parameterized `CALL` automatically after `RAW_LOADED`. Submission is
+asynchronous: Python records `transform_job_id` but never waits for completion.
+If a job ID is already recorded for the run, it is reused and a duplicate CALL
+is not submitted. Check `job_run_control.transform_status` for the authoritative
+transformation result.
+
 Run tests and parity validation:
 
 ```powershell
@@ -284,23 +298,23 @@ Build the Cloud Run-compatible Linux container locally:
 docker build -t job-market-pipeline .
 ```
 
-## Future orchestration (not deployed)
+## Optional orchestration (not deployed)
 
 No Scheduler, IAM, service-account, Secret Manager, or Cloud Run configuration
 is created by this repository change.
 
-Two future trigger designs are supported conceptually:
+The optional Cloud Run submission path is implemented behind
+`AUTO_TRANSFORM=false`. A separate future trigger remains possible:
 
-1. After RAW load, Cloud Run submits one BigQuery job containing only
+1. Implemented but disabled: after RAW load, Cloud Run submits one BigQuery job containing only
    `CALL process_job_run(run_id)`. This avoids a timing race and starts promptly
    while keeping all transformation compute inside BigQuery.
 2. A BigQuery Scheduled Query finds `RAW_LOADED`/`PENDING` runs and calls the
    procedure. This separates ingestion and warehouse scheduling but adds
    polling latency, locking, and a second scheduler configuration.
 
-The first option is recommended because it provides one event-driven chain
-without moving transformation logic back into Cloud Run. It is intentionally
-disabled until deployment/orchestration work is separately authorized.
+The first option remains disabled until Cloud Run configuration is separately
+authorized. Neither option changes where transformation compute executes.
 
 ## Known limitations
 
