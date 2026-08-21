@@ -150,6 +150,43 @@ class PaginationTests(unittest.TestCase):
             ["Canada", "Ontario", "Toronto"],
         )
 
+    def test_raw_records_preserve_cross_page_duplicates_and_provenance(self):
+        request = RequestSequence([
+            FakeResponse([api_job(1), api_job(2)]),
+            FakeResponse([api_job(2)]),
+        ])
+
+        fetched, pages = extractor.fetch_all_job_records(
+            config(), "app-id", "app-key", request
+        )
+        records = [
+            extractor.build_raw_record(item, config()) for item in fetched
+        ]
+
+        self.assertEqual(pages, 2)
+        self.assertEqual([row["source_job_id"] for row in records], ["1", "2", "2"])
+        self.assertEqual(records[0]["page_number"], 1)
+        self.assertEqual(records[0]["position_in_page"], 1)
+        self.assertEqual(records[2]["page_number"], 2)
+        self.assertEqual(records[2]["position_in_page"], 1)
+
+    def test_raw_record_contains_source_metadata_and_payload(self):
+        source = api_job(7)
+        source["redirect_url"] = (
+            "https://www.adzuna.ca/details/7?utm_source=secret-app-id&x=1"
+        )
+        record = extractor.build_raw_record(
+            {"payload": source, "page_number": 2, "position_in_page": 4},
+            config(),
+        )
+
+        self.assertEqual(record["search_role"], "Data Analyst")
+        self.assertEqual(record["search_location"], "Toronto")
+        self.assertEqual(record["source"], "Adzuna")
+        self.assertEqual(record["raw_payload"]["id"], "7")
+        self.assertNotIn("utm_source", record["raw_payload"]["redirect_url"])
+        self.assertIn("x=1", record["raw_payload"]["redirect_url"])
+
 
 if __name__ == "__main__":
     unittest.main()

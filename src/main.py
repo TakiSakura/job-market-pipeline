@@ -80,6 +80,28 @@ def normalize_job(job):
     }
 
 
+def sanitize_raw_payload(job):
+    """Copy the source ad while removing credential-linked URL attribution."""
+    payload = json.loads(json.dumps(job))
+    if payload.get("redirect_url"):
+        payload["redirect_url"] = sanitize_job_url(payload["redirect_url"])
+    return payload
+
+
+def build_raw_record(fetched_job, config):
+    payload = fetched_job["payload"]
+    normalized = normalize_job(payload)
+    return {
+        **normalized,
+        "source_job_id": normalized["job_id"],
+        "page_number": fetched_job["page_number"],
+        "position_in_page": fetched_job["position_in_page"],
+        "search_role": config["role"],
+        "search_location": config["location"],
+        "raw_payload": sanitize_raw_payload(payload),
+    }
+
+
 def positive_integer(config, field, default):
     value = config.get(field, default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -133,7 +155,7 @@ def request_page(country, page, params, request_get=None):
     return results
 
 
-def fetch_all_jobs(config, app_id, app_key, request_get=None):
+def fetch_all_job_records(config, app_id, app_key, request_get=None):
     results_per_page = positive_integer(
         config,
         "results_per_page",
@@ -170,7 +192,14 @@ def fetch_all_jobs(config, app_id, app_key, request_get=None):
             print(f"Page {page} was empty; pagination complete.")
             break
 
-        all_results.extend(page_results)
+        all_results.extend(
+            {
+                "payload": job,
+                "page_number": page,
+                "position_in_page": position,
+            }
+            for position, job in enumerate(page_results, start=1)
+        )
 
         if len(page_results) < results_per_page:
             print(
@@ -180,6 +209,17 @@ def fetch_all_jobs(config, app_id, app_key, request_get=None):
             break
 
     return all_results, pages_fetched
+
+
+def fetch_all_jobs(config, app_id, app_key, request_get=None):
+    """Backward-compatible payload-only pagination helper for ETL comparison."""
+    records, pages_fetched = fetch_all_job_records(
+        config,
+        app_id,
+        app_key,
+        request_get=request_get,
+    )
+    return [record["payload"] for record in records], pages_fetched
 
 
 def deduplicate_jobs(jobs):
@@ -226,14 +266,16 @@ def main():
     print(f"Results per page: {results_per_page}")
     print(f"Maximum pages: {max_pages}")
 
-    results, pages_fetched = fetch_all_jobs(config, app_id, app_key)
-    normalized_jobs = [normalize_job(job) for job in results]
-    jobs = deduplicate_jobs(normalized_jobs)
+    fetched_jobs, pages_fetched = fetch_all_job_records(config, app_id, app_key)
+    jobs = [build_raw_record(job, config) for job in fetched_jobs]
+    source_job_ids = [job["source_job_id"] for job in jobs if job["source_job_id"]]
+    unique_source_jobs = len(set(source_job_ids))
+    duplicate_source_rows = len(source_job_ids) - unique_source_jobs
 
     print(f"Pages fetched: {pages_fetched}")
-    print(f"Total raw jobs before deduplication: {len(normalized_jobs)}")
-    print(f"Unique raw jobs: {len(jobs)}")
-    print(f"Duplicates removed: {len(normalized_jobs) - len(jobs)}")
+    print(f"Raw source rows: {len(jobs)}")
+    print(f"Unique source job IDs: {unique_source_jobs}")
+    print(f"Duplicate source rows preserved: {duplicate_source_rows}")
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as file:

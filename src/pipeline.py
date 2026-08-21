@@ -6,7 +6,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline_config import PIPELINE_RUN_ID_ENV
+from google.cloud import bigquery
+
+from pipeline_config import (
+    PIPELINE_RUN_ID_ENV,
+    PROJECT_ID,
+    get_quality_publish_threshold,
+)
+from run_control import mark_extract_failed, mark_raw_loaded, start_ingestion_run
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -115,12 +122,14 @@ def main():
     run_id = str(uuid.uuid4())
     started_at = utc_now()
 
-    status = "RUNNING"
+    status = "EXTRACTING"
     error_message = None
     failed_step = None
+    control_started = False
 
     records_extracted = 0
     records_clean = 0
+    publish_threshold = get_quality_publish_threshold()
 
     print("\nJOB MARKET DATA PIPELINE")
     print("=" * 60)
@@ -133,6 +142,14 @@ def main():
     )
 
     try:
+        control_client = bigquery.Client(project=PROJECT_ID)
+        start_ingestion_run(
+            control_client,
+            run_id,
+            started_at,
+            publish_threshold,
+        )
+        control_started = True
 
         # -------------------------
         # STEP 1: EXTRACT
@@ -162,87 +179,18 @@ def main():
             run_id,
         )
 
-        # -------------------------
-        # STEP 3: CLEAN
-        # -------------------------
-
-        failed_step = "CLEAN"
-
-        run_step(
-            "CLEAN",
-            "clean_jobs.py",
+        mark_raw_loaded(
+            control_client,
             run_id,
+            utc_now(),
+            records_extracted,
         )
 
-        records_clean = load_record_count(
-            CLEAN_PATH
-        )
-
-        # -------------------------
-        # STEP 4: DATA QUALITY / SCORING
-        # -------------------------
-
-        failed_step = "DATA_QUALITY"
-
-        run_step(
-            "DATA QUALITY / SCORING",
-            "data_quality.py",
-            run_id,
-        )
-
-        # -------------------------
-        # STEP 5: BIGQUERY CURATED + PUBLISH VIEW
-        # -------------------------
-
-        failed_step = "BIGQUERY_CURATED"
-
-        run_step(
-            "BIGQUERY CURATED",
-            "load_curated_bigquery.py",
-            run_id,
-        )
-
-        # -------------------------
-        # STEP 6: BIGQUERY CURRENT
-        # -------------------------
-
-        failed_step = "BIGQUERY_CURRENT"
-
-        run_step(
-            "BIGQUERY CURRENT",
-            "load_bigquery.py",
-            run_id,
-        )
-
-        # -------------------------
-        # STEP 7: BIGQUERY OBSERVATIONS
-        # -------------------------
-
-        failed_step = "BIGQUERY_OBSERVATIONS"
-
-        run_step(
-            "BIGQUERY OBSERVATIONS",
-            "load_observations_bigquery.py",
-            run_id,
-        )
-
-        # -------------------------
-        # STEP 8: BIGQUERY STATE
-        # -------------------------
-
-        failed_step = "BIGQUERY_STATE"
-
-        run_step(
-            "BIGQUERY STATE",
-            "track_history.py",
-            run_id,
-        )
-
-        status = "SUCCESS"
+        status = "RAW_LOADED"
         failed_step = None
 
     except subprocess.CalledProcessError as error:
-        status = "FAILED"
+        status = "EXTRACT_FAILED"
 
         error_message = (
             f"Step {failed_step} failed "
@@ -250,8 +198,22 @@ def main():
         )
 
     except Exception as error:
-        status = "FAILED"
+        status = "EXTRACT_FAILED"
         error_message = str(error)
+
+    if status == "EXTRACT_FAILED" and control_started:
+        try:
+            mark_extract_failed(
+                control_client,
+                run_id,
+                utc_now(),
+                error_message,
+            )
+        except Exception as control_error:
+            print(
+                "[WARNING] Failed to record extraction failure in run control: "
+                f"{control_error}"
+            )
 
     finished_at = utc_now()
 
@@ -287,10 +249,10 @@ def main():
 
     print("\n" + "=" * 60)
 
-    if status == "SUCCESS":
-        print("PIPELINE SUCCESS")
+    if status == "RAW_LOADED":
+        print("INGESTION RAW_LOADED")
     else:
-        print("PIPELINE FAILED")
+        print("INGESTION EXTRACT_FAILED")
 
     print("=" * 60)
 
@@ -320,7 +282,7 @@ def main():
         f"{RUN_LOG_PATH}"
     )
 
-    if status == "FAILED":
+    if status == "EXTRACT_FAILED":
         print(
             f"Failed step: {failed_step}"
         )

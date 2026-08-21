@@ -28,6 +28,12 @@ RAW_SCHEMA = [
     bigquery.SchemaField("contract_type", "STRING"),
     bigquery.SchemaField("source", "STRING"),
     bigquery.SchemaField("job_url", "STRING"),
+    bigquery.SchemaField("source_job_id", "STRING"),
+    bigquery.SchemaField("page_number", "INTEGER"),
+    bigquery.SchemaField("position_in_page", "INTEGER"),
+    bigquery.SchemaField("search_role", "STRING"),
+    bigquery.SchemaField("search_location", "STRING"),
+    bigquery.SchemaField("raw_payload", "JSON"),
 ]
 
 
